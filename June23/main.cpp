@@ -5,6 +5,7 @@
 #include <map>
 #include <mutex>
 #include <algorithm>
+#include <random>
 
 constexpr int NUM_ROUNDS = 3;
 std::mutex cout_mutex;
@@ -22,6 +23,9 @@ struct Player {
     int score = 0;
     bool active = false;
     char lastAnswer = ' ';
+    bool used5050 = false;
+    bool usedCall = false;
+    bool usedAsk = false;
 };
 
 std::vector<Question> questions = {
@@ -60,42 +64,105 @@ void playerLogin(Player& player, std::vector<Player*>& activePlayers, std::mutex
     }
 }
 
-void playRound(int roundNumber, const Question& q, std::vector<Player*>& players) {
-    {
-        std::scoped_lock lock(cout_mutex);
-        std::cout << "\n🟦 Round " << roundNumber << " 🟦\n";
-        std::cout << q.text << "\n";
-        for (auto& [opt, text] : q.options) {
-            std::cout << "  " << opt << ") " << text << "\n";
-        }
-        std::cout << "=========================\n";
+void showOptions(const std::map<char, std::string>& options, const std::vector<char>& hide = {}) {
+    for (const auto& [key, text] : options) {
+        if (std::find(hide.begin(), hide.end(), key) == hide.end())
+            std::cout << "  " << key << ") " << text << "\n";
+    }
+}
+
+void use5050(const Question& q, Player& player, std::vector<char>& hiddenOptions) {
+    if (player.used5050) {
+        std::cout << "You already used 50/50.\n";
+        return;
     }
 
+    player.used5050 = true;
+    std::vector<char> wrongChoices;
+    for (const auto& [opt, _] : q.options)
+        if (opt != q.correct)
+            wrongChoices.push_back(opt);
+
+    std::shuffle(wrongChoices.begin(), wrongChoices.end(), std::mt19937{ std::random_device{}() });
+    hiddenOptions.push_back(wrongChoices[0]);
+    hiddenOptions.push_back(wrongChoices[1]);
+
+    std::cout << "[50/50] Two wrong options removed!\n";
+}
+
+void useCallFriend(const Question& q, Player& player) {
+    if (player.usedCall) {
+        std::cout << "You already used Call a Friend.\n";
+        return;
+    }
+
+    player.usedCall = true;
+    bool friendCorrect = (rand() % 100 < 80);
+    char suggestion = friendCorrect ? q.correct : 'A' + rand() % 4;
+    std::cout << "[Call a Friend] Your friend thinks the answer is: " << suggestion << "\n";
+}
+
+void useAskAudience(const Question& q, Player& player) {
+    if (player.usedAsk) {
+        std::cout << "You already used Ask the Audience.\n";
+        return;
+    }
+
+    player.usedAsk = true;
+    std::map<char, int> poll = {
+        {'A', 10}, {'B', 10}, {'C', 10}, {'D', 10}
+    };
+    poll[q.correct] += 60;
+
+    std::cout << "[Ask the Audience] Audience Poll Results:\n";
+    for (const auto& [opt, votes] : poll) {
+        std::cout << "  " << opt << ": " << votes << "%\n";
+    }
+}
+
+void playRound(int roundNumber, const Question& q, std::vector<Player*>& players) {
+    std::cout << "\n🟦 Round " << roundNumber << " 🟦\n";
+    std::cout << q.text << "\n";
+    showOptions(q.options);
+    std::cout << "=========================\n";
+
     for (Player* player : players) {
-        std::string input;
-        char ans = ' ';
+        char finalAnswer = ' ';
+        std::vector<char> hiddenOptions;
 
         while (true) {
             std::scoped_lock input_lock(input_mutex);
-            std::cout << "[" << player->name << "] Enter your answer (A/B/C/D): ";
+            std::cout << "[" << player->name << "] Choose A/B/C/D or type lifeline (5050 / call / ask): ";
+            std::string input;
             std::getline(std::cin, input);
-            if (input.size() == 1 && q.options.count(toupper(input[0]))) {
-                ans = toupper(input[0]);
+
+            std::transform(input.begin(), input.end(), input.begin(), ::tolower);
+
+            if (input == "5050") {
+                use5050(q, *player, hiddenOptions);
+                showOptions(q.options, hiddenOptions);
+            }
+            else if (input == "call") {
+                useCallFriend(q, *player);
+            }
+            else if (input == "ask") {
+                useAskAudience(q, *player);
+            }
+            else if (input.size() == 1 && q.options.count(toupper(input[0])) &&
+                     std::find(hiddenOptions.begin(), hiddenOptions.end(), toupper(input[0])) == hiddenOptions.end()) {
+                finalAnswer = toupper(input[0]);
                 break;
             }
-            std::cout << "Invalid choice. Please enter A, B, C, or D.\n";
+            else {
+                std::cout << "Invalid input.\n";
+            }
         }
 
-        player->lastAnswer = ans;
+        player->lastAnswer = finalAnswer;
     }
 
-    {
-        std::scoped_lock lock(cout_mutex);
-        std::cout << "\n✅ Round Results:\n";
-    }
-
+    std::cout << "\n✅ Round Results:\n";
     for (Player* player : players) {
-        std::scoped_lock lock(cout_mutex);
         std::cout << player->name << " answered: " << player->lastAnswer << " - ";
         if (player->lastAnswer == q.correct) {
             player->score += 10;
@@ -105,12 +172,9 @@ void playRound(int roundNumber, const Question& q, std::vector<Player*>& players
         }
     }
 
-    {
-        std::scoped_lock lock(cout_mutex);
-        std::cout << "\n📊 Scores After Round " << roundNumber << ":\n";
-        for (Player* player : players)
-            std::cout << player->name << ": " << player->score << " points\n";
-    }
+    std::cout << "\n📊 Scores After Round " << roundNumber << ":\n";
+    for (Player* player : players)
+        std::cout << player->name << ": " << player->score << " points\n";
 }
 
 void declareWinner(const std::vector<Player*>& players) {
@@ -151,6 +215,5 @@ int main() {
     }
 
     declareWinner(activePlayers);
-
     return 0;
 }
