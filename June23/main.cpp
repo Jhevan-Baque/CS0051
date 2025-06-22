@@ -2,99 +2,115 @@
 #include <thread>
 #include <vector>
 #include <string>
-#include <random>
+#include <map>
+#include <mutex>
 #include <latch>
 #include <barrier>
 #include <future>
-#include <mutex>
-#include <map>
-#include <algorithm>
+#include <random>
 
-std::mutex cout_mutex;
 constexpr int NUM_PLAYERS = 3;
 constexpr int NUM_ROUNDS = 3;
 
+std::mutex cout_mutex;
+std::mutex input_mutex; // To avoid mixed inputs
+
+struct Question {
+    std::string text;
+    std::map<char, std::string> options;
+    char correct;
+};
+
 struct Player {
     int id;
+    std::string name;
     int score = 0;
     bool used5050 = false;
     bool usedCallFriend = false;
 };
 
-struct Question {
-    std::string questionText;
-    std::map<char, std::string> options;
-    char correctAnswer;
-};
-
 std::vector<Question> questions = {
-    {"What is the capital of France?",
-     {{'A', "Berlin"}, {'B', "Paris"}, {'C', "Rome"}, {'D', "Madrid"}},
-     'B'},
-    {"Which planet is known as the Red Planet?",
-     {{'A', "Mars"}, {'B', "Earth"}, {'C', "Jupiter"}, {'D', "Venus"}},
-     'A'},
-    {"Who wrote 'Hamlet'?",
-     {{'A', "Charles Dickens"}, {'B', "Mark Twain"}, {'C', "William Shakespeare"}, {'D', "Jane Austen"}},
-     'C'}
+    { "What is the capital of France?",
+      {{'A', "London"}, {'B', "Paris"}, {'C', "Berlin"}, {'D', "Madrid"}}, 'B' },
+    { "Which is the Red Planet?",
+      {{'A', "Venus"}, {'B', "Earth"}, {'C', "Mars"}, {'D', "Jupiter"}}, 'C' },
+    { "Who wrote Romeo and Juliet?",
+      {{'A', "Shakespeare"}, {'B', "Hemingway"}, {'C', "Tolkien"}, {'D', "Rowling"}}, 'A' }
 };
 
-char useLifeline5050(const Question& q, Player& player) {
+char use5050(const Question& q, Player& player) {
     player.used5050 = true;
-    std::vector<char> wrongChoices;
-    for (const auto& [opt, text] : q.options)
-        if (opt != q.correctAnswer)
-            wrongChoices.push_back(opt);
-    std::shuffle(wrongChoices.begin(), wrongChoices.end(), std::mt19937{std::random_device{}()});
+    std::vector<char> options = { q.correct };
+    for (const auto& [key, _] : q.options) {
+        if (key != q.correct) {
+            options.push_back(key);
+            break;
+        }
+    }
     std::scoped_lock lock(cout_mutex);
-    std::cout << "[Player " << player.id << "] used 50/50! Options left: "
-              << q.correctAnswer << ", " << wrongChoices[0] << "\n";
-    return (rand() % 2 == 0) ? q.correctAnswer : wrongChoices[0];
+    std::cout << "[" << player.name << "] used 50/50. Choices: " << options[0] << " and " << options[1] << "\n";
+    return options[rand() % 2];
 }
 
 char useCallFriend(const Question& q, Player& player) {
     player.usedCallFriend = true;
     std::scoped_lock lock(cout_mutex);
-    std::cout << "[Player " << player.id << "] used Call a Friend! They suggest: " << q.correctAnswer << "\n";
-    return (rand() % 4 == 0) ? q.correctAnswer : 'A' + rand() % 4;
+    std::cout << "[" << player.name << "] used Call a Friend. Friend suggests: " << q.correct << "\n";
+    return (rand() % 4 == 0) ? q.correct : 'A' + rand() % 4;
 }
 
 char simulateAnswer(Player& player, const Question& q) {
     int lifeline = rand() % 5;
-    if (!player.used5050 && lifeline == 0) return useLifeline5050(q, player);
-    if (!player.usedCallFriend && lifeline == 1) return useCallFriend(q, player);
-    char randomAnswer = 'A' + rand() % 4;
-    return randomAnswer;
+    if (!player.used5050 && lifeline == 0)
+        return use5050(q, player);
+    if (!player.usedCallFriend && lifeline == 1)
+        return useCallFriend(q, player);
+    return 'A' + rand() % 4;
 }
 
-void quizGame(std::latch& loginLatch, std::barrier<>& roundBarrier, Player& player) {
+void playerThread(Player& player, std::latch& loginLatch, std::barrier<>& roundBarrier) {
     {
+        std::scoped_lock input_lock(input_mutex);
+        std::cout << "Player " << player.id << ", enter your name: ";
+        std::getline(std::cin, player.name);
+
+        std::string confirm;
+        do {
+            std::cout << "[" << player.name << "] type 'join' to join the quiz: ";
+            std::getline(std::cin, confirm);
+        } while (confirm != "join");
+
         std::scoped_lock lock(cout_mutex);
-        std::cout << "[Player " << player.id << "] has joined.\n";
+        std::cout << "[" << player.name << "] has joined the game.\n";
     }
+
     loginLatch.count_down();
     loginLatch.wait();
 
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         const Question& q = questions[round];
-        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // simulate thinking
+
+        {
+            std::scoped_lock lock(cout_mutex);
+            std::cout << "\n[Round " << (round + 1) << "] " << player.name << ", thinking...\n";
+        }
+
         char answer = simulateAnswer(player, q);
 
         roundBarrier.arrive_and_wait();
 
-        auto evalTask = std::async(std::launch::async, [&]() {
+        std::future<void> eval = std::async(std::launch::async, [&]() {
             std::scoped_lock lock(cout_mutex);
-            std::cout << "[Player " << player.id << "] answered: " << answer << "\n";
-            std::cout << "Evaluating answer for Player " << player.id << "...\n";
-            if (answer == q.correctAnswer) {
+            std::cout << "[" << player.name << "] answered: " << answer << "\n";
+            if (answer == q.correct) {
                 player.score += 10;
-                std::cout << "Correct! +10 points to Player " << player.id << "\n";
+                std::cout << "Correct! +10 points to " << player.name << "\n";
             } else {
-                std::cout << "Wrong answer by Player " << player.id << "\n";
+                std::cout << "Wrong answer.\n";
             }
         });
-        evalTask.wait();
 
+        eval.wait();
         roundBarrier.arrive_and_wait();
     }
 }
@@ -108,22 +124,23 @@ int main() {
 
     for (int i = 0; i < NUM_PLAYERS; ++i) {
         players[i].id = i + 1;
-        threads.emplace_back(quizGame, std::ref(loginLatch), std::ref(roundBarrier), std::ref(players[i]));
+        threads.emplace_back(playerThread, std::ref(players[i]), std::ref(loginLatch), std::ref(roundBarrier));
     }
 
     for (auto& t : threads) t.join();
 
     std::cout << "\n=== Final Scores ===\n";
-    int highScore = 0;
+    int maxScore = 0;
     for (const auto& p : players) {
-        std::cout << "Player " << p.id << ": " << p.score << " points\n";
-        highScore = std::max(highScore, p.score);
+        std::cout << p.name << ": " << p.score << " points\n";
+        maxScore = std::max(maxScore, p.score);
     }
 
     std::cout << "\n🏆 Winner(s): ";
     for (const auto& p : players)
-        if (p.score == highScore)
-            std::cout << "Player " << p.id << " ";
+        if (p.score == maxScore)
+            std::cout << p.name << " ";
     std::cout << "\n";
+
     return 0;
 }
