@@ -4,16 +4,13 @@
 #include <string>
 #include <map>
 #include <mutex>
-#include <latch>
 #include <barrier>
 #include <future>
 #include <random>
 
-constexpr int NUM_PLAYERS = 3;
 constexpr int NUM_ROUNDS = 3;
-
 std::mutex cout_mutex;
-std::mutex input_mutex; // To avoid mixed inputs
+std::mutex input_mutex;
 
 struct Question {
     std::string text;
@@ -27,6 +24,7 @@ struct Player {
     int score = 0;
     bool used5050 = false;
     bool usedCallFriend = false;
+    bool active = false; // did they join?
 };
 
 std::vector<Question> questions = {
@@ -41,12 +39,12 @@ std::vector<Question> questions = {
 char use5050(const Question& q, Player& player) {
     player.used5050 = true;
     std::vector<char> options = { q.correct };
-    for (const auto& [key, _] : q.options) {
+    for (const auto& [key, _] : q.options)
         if (key != q.correct) {
             options.push_back(key);
             break;
         }
-    }
+
     std::scoped_lock lock(cout_mutex);
     std::cout << "[" << player.name << "] used 50/50. Choices: " << options[0] << " and " << options[1] << "\n";
     return options[rand() % 2];
@@ -68,79 +66,104 @@ char simulateAnswer(Player& player, const Question& q) {
     return 'A' + rand() % 4;
 }
 
-void playerThread(Player& player, std::latch& loginLatch, std::barrier<>& roundBarrier) {
+// Player thread
+void playerThread(Player& player, std::vector<Player*>& activePlayers, std::mutex& activeMutex) {
     {
         std::scoped_lock input_lock(input_mutex);
         std::cout << "Player " << player.id << ", enter your name: ";
         std::getline(std::cin, player.name);
 
-        std::string confirm;
-        do {
-            std::cout << "[" << player.name << "] type 'join' to join the quiz: ";
-            std::getline(std::cin, confirm);
-        } while (confirm != "join");
+        std::string response;
+        std::cout << "[" << player.name << "] Do you want to join the quiz? (yes/no): ";
+        std::getline(std::cin, response);
 
-        std::scoped_lock lock(cout_mutex);
-        std::cout << "[" << player.name << "] has joined the game.\n";
-    }
-
-    loginLatch.count_down();
-    loginLatch.wait();
-
-    for (int round = 0; round < NUM_ROUNDS; ++round) {
-        const Question& q = questions[round];
-
-        {
+        if (response != "yes") {
             std::scoped_lock lock(cout_mutex);
-            std::cout << "\n[Round " << (round + 1) << "] " << player.name << ", thinking...\n";
+            std::cout << "[" << player.name << "] chose not to join.\n";
+            return; // exits the thread, doesn't play
         }
 
-        char answer = simulateAnswer(player, q);
+        player.active = true;
+        std::scoped_lock lock(cout_mutex);
+        std::cout << "[" << player.name << "] has joined the quiz!\n";
 
-        roundBarrier.arrive_and_wait();
-
-        std::future<void> eval = std::async(std::launch::async, [&]() {
-            std::scoped_lock lock(cout_mutex);
-            std::cout << "[" << player.name << "] answered: " << answer << "\n";
-            if (answer == q.correct) {
-                player.score += 10;
-                std::cout << "Correct! +10 points to " << player.name << "\n";
-            } else {
-                std::cout << "Wrong answer.\n";
-            }
-        });
-
-        eval.wait();
-        roundBarrier.arrive_and_wait();
+        std::scoped_lock lockActive(activeMutex);
+        activePlayers.push_back(&player);
     }
 }
 
+void runGame(std::vector<Player*>& activePlayers) {
+    if (activePlayers.empty()) {
+        std::cout << "\n❌ No players joined. Game cancelled.\n";
+        return;
+    }
+
+    std::cout << "\n✅ Starting game with " << activePlayers.size() << " player(s).\n";
+
+    std::barrier roundBarrier(static_cast<int>(activePlayers.size()));
+
+    std::vector<std::thread> quizThreads;
+
+    for (Player* player : activePlayers) {
+        quizThreads.emplace_back([&roundBarrier, player]() {
+            for (int round = 0; round < NUM_ROUNDS; ++round) {
+                const Question& q = questions[round];
+
+                {
+                    std::scoped_lock lock(cout_mutex);
+                    std::cout << "\n[Round " << round + 1 << "] " << player->name << ", thinking...\n";
+                }
+
+                char answer = simulateAnswer(*player, q);
+                roundBarrier.arrive_and_wait();
+
+                std::future<void> eval = std::async(std::launch::async, [=]() {
+                    std::scoped_lock lock(cout_mutex);
+                    std::cout << "[" << player->name << "] answered: " << answer << "\n";
+                    if (answer == q.correct) {
+                        player->score += 10;
+                        std::cout << "Correct! +10 points to " << player->name << "\n";
+                    } else {
+                        std::cout << "Wrong answer.\n";
+                    }
+                });
+
+                eval.wait();
+                roundBarrier.arrive_and_wait();
+            }
+        });
+    }
+
+    for (auto& t : quizThreads) t.join();
+
+    std::cout << "\n=== Final Scores ===\n";
+    int highScore = 0;
+    for (const auto* p : activePlayers) {
+        std::cout << p->name << ": " << p->score << " points\n";
+        highScore = std::max(highScore, p->score);
+    }
+
+    std::cout << "\n🏆 Winner(s): ";
+    for (const auto* p : activePlayers)
+        if (p->score == highScore)
+            std::cout << p->name << " ";
+    std::cout << "\n";
+}
+
 int main() {
-    std::latch loginLatch(NUM_PLAYERS);
-    std::barrier roundBarrier(NUM_PLAYERS);
-
-    std::vector<Player> players(NUM_PLAYERS);
+    int maxPlayers = 3;
+    std::vector<Player> players(maxPlayers);
     std::vector<std::thread> threads;
+    std::vector<Player*> activePlayers;
+    std::mutex activeMutex;
 
-    for (int i = 0; i < NUM_PLAYERS; ++i) {
+    for (int i = 0; i < maxPlayers; ++i) {
         players[i].id = i + 1;
-        threads.emplace_back(playerThread, std::ref(players[i]), std::ref(loginLatch), std::ref(roundBarrier));
+        threads.emplace_back(playerThread, std::ref(players[i]), std::ref(activePlayers), std::ref(activeMutex));
     }
 
     for (auto& t : threads) t.join();
 
-    std::cout << "\n=== Final Scores ===\n";
-    int maxScore = 0;
-    for (const auto& p : players) {
-        std::cout << p.name << ": " << p.score << " points\n";
-        maxScore = std::max(maxScore, p.score);
-    }
-
-    std::cout << "\n🏆 Winner(s): ";
-    for (const auto& p : players)
-        if (p.score == maxScore)
-            std::cout << p.name << " ";
-    std::cout << "\n";
-
+    runGame(activePlayers);
     return 0;
 }
