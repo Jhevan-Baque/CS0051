@@ -96,62 +96,71 @@ void useAskAudience(const Question& q, Player& player) {
         cout << "  " << opt << ": " << votes << "%\n";
 }
 
-bool answerTimedInput(Player* player, const Question& q, string& input, vector<char>& hiddenOptions) {
+bool getTimedAnswer(Player* player, const Question& q, vector<char>& hiddenOptions, char& finalAnswer) {
     atomic<bool> timeout(false);
+    string input;
+
     thread timerThread([&]() {
         this_thread::sleep_for(chrono::seconds(10));
         timeout = true;
     });
 
-    while (true) {
-        {
-            scoped_lock input_lock(input_mutex);
-            cout << "[" << player->name << "] You have 10 seconds to answer.\n";
-            cout << "[" << player->name << "] Enter A/B/C/D or lifeline (5050 / call / ask): ";
-            getline(cin, input);
-        }
-
-        transform(input.begin(), input.end(), input.begin(), ::tolower);
-
-        if (timeout) break;
-
-        if (input == "5050") {
-            use5050(q, *player, hiddenOptions);
-            showOptions(q.options, hiddenOptions);
-        } else if (input == "call") {
-            useCallFriend(q, *player);
-        } else if (input == "ask") {
-            useAskAudience(q, *player);
-        } else if (input.size() == 1 && q.options.count(toupper(input[0])) &&
-                   find(hiddenOptions.begin(), hiddenOptions.end(), toupper(input[0])) == hiddenOptions.end()) {
-            timerThread.join();
-            if (timeout) return false;
-            return true;
-        } else {
-            cout << "Invalid input.\n";
-        }
-
-        if (timeout) break;
+    {
+        scoped_lock input_lock(input_mutex);
+        cout << "[" << player->name << "] Now type your final answer (A/B/C/D): ";
+        getline(cin, input);
     }
 
     timerThread.join();
+
+    if (timeout) {
+        return false;
+    }
+
+    if (input.size() == 1) {
+        char ans = toupper(input[0]);
+        if (q.options.count(ans) && find(hiddenOptions.begin(), hiddenOptions.end(), ans) == hiddenOptions.end()) {
+            finalAnswer = ans;
+            return true;
+        }
+    }
+
     return false;
 }
 
 void answerQuestion(Player* player, const Question& q) {
     char finalAnswer = ' ';
     vector<char> hiddenOptions;
-    string input;
 
-    bool onTime = answerTimedInput(player, q, input, hiddenOptions);
+    while (true) {
+        scoped_lock input_lock(input_mutex);
+        cout << "[" << player->name << "] Choose a lifeline or type 'ready' to answer:\n";
+        cout << "  - 5050\n  - call\n  - ask\n  - ready\n> ";
+        string choice;
+        getline(cin, choice);
+        transform(choice.begin(), choice.end(), choice.begin(), ::tolower);
 
-    if (!onTime) {
-        player->lastAnswer = 'X'; // Timeout or invalid
-        return;
+        if (choice == "5050") {
+            use5050(q, *player, hiddenOptions);
+            showOptions(q.options, hiddenOptions);
+        } else if (choice == "call") {
+            useCallFriend(q, *player);
+        } else if (choice == "ask") {
+            useAskAudience(q, *player);
+        } else if (choice == "ready") {
+            break;
+        } else {
+            cout << "Invalid input.\n";
+        }
     }
 
-    finalAnswer = toupper(input[0]);
-    player->lastAnswer = finalAnswer;
+    bool valid = getTimedAnswer(player, q, hiddenOptions, finalAnswer);
+    if (valid) {
+        player->lastAnswer = finalAnswer;
+    } else {
+        cout << "[" << player->name << "] Answer invalid or timed out. Marked incorrect.\n";
+        player->lastAnswer = 'X';
+    }
 }
 
 void evaluateAnswers(const vector<Player*>& players, const Question& q) {
