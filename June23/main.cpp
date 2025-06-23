@@ -166,7 +166,7 @@ int main() {
     vector<thread> threads;
     vector<bool> joined(maxPlayers, false);
 
-    std::latch latch(maxPlayers);
+    latch latch(maxPlayers);
 
     for (int i = 0; i < maxPlayers; ++i) {
         players[i].id = i + 1;
@@ -207,7 +207,7 @@ int main() {
 
     cout << "\nGame Starting with " << activePlayers.size() << " players...\n";
 
-    std::barrier roundBarrier((int)activePlayers.size());
+    barrier roundBarrier((int)activePlayers.size());
 
     // Step 2: Quiz Rounds
     for (int round = 0; round < NUM_ROUNDS; ++round) {
