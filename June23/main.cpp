@@ -9,6 +9,8 @@
 #include <future>
 #include <latch>
 #include <barrier>
+#include <condition_variable>
+#include <chrono>
 
 using namespace std;
 
@@ -94,31 +96,72 @@ void useAskAudience(const Question& q, Player& player) {
         cout << "  " << opt << ": " << votes << "%\n";
 }
 
+bool timedInput(Player* player, const Question& q, string& userInput, vector<char>& hiddenOptions) {
+    mutex mtx;
+    condition_variable cv;
+    bool answered = false;
+    int timeLimit = 10;
+
+    thread timerThread([&]() {
+        unique_lock lock(mtx);
+        if (!cv.wait_for(lock, chrono::seconds(timeLimit), [&] { return answered; })) {
+            cout << "\n[" << player->name << "] Time's up!\n";
+            userInput = "TIMEOUT";
+        }
+    });
+
+    while (!answered) {
+        {
+            scoped_lock input_lock(input_mutex);
+            cout << "[" << player->name << "] Choose A/B/C/D or lifeline (5050 / call / ask): ";
+            getline(cin, userInput);
+            transform(userInput.begin(), userInput.end(), userInput.begin(), ::tolower);
+        }
+
+        if (userInput == "5050" || userInput == "call" || userInput == "ask") {
+            timeLimit += 5;
+            cout << "[Time Extended by 5s for lifeline. New total: " << timeLimit << "s]\n";
+
+            if (userInput == "5050") {
+                use5050(q, *player, hiddenOptions);
+                showOptions(q.options, hiddenOptions);
+            } else if (userInput == "call") {
+                useCallFriend(q, *player);
+            } else if (userInput == "ask") {
+                useAskAudience(q, *player);
+            }
+
+            continue;
+        } else {
+            {
+                lock_guard lock(mtx);
+                answered = true;
+            }
+            cv.notify_one();
+            break;
+        }
+    }
+
+    timerThread.join();
+    return userInput != "TIMEOUT";
+}
+
 void answerQuestion(Player* player, const Question& q) {
     char finalAnswer = ' ';
     vector<char> hiddenOptions;
 
-    while (true) {
-        scoped_lock input_lock(input_mutex);
-        cout << "[" << player->name << "] Choose A/B/C/D or lifeline (5050 / call / ask): ";
-        string input;
-        getline(cin, input);
-        transform(input.begin(), input.end(), input.begin(), ::tolower);
+    string input;
+    if (!timedInput(player, q, input, hiddenOptions)) {
+        player->lastAnswer = 'X';  // timeout
+        return;
+    }
 
-        if (input == "5050") {
-            use5050(q, *player, hiddenOptions);
-            showOptions(q.options, hiddenOptions);
-        } else if (input == "call") {
-            useCallFriend(q, *player);
-        } else if (input == "ask") {
-            useAskAudience(q, *player);
-        } else if (input.size() == 1 && q.options.count(toupper(input[0])) &&
-                   find(hiddenOptions.begin(), hiddenOptions.end(), toupper(input[0])) == hiddenOptions.end()) {
-            finalAnswer = toupper(input[0]);
-            break;
-        } else {
-            cout << "Invalid input.\n";
-        }
+    if (input.size() == 1 && q.options.count(toupper(input[0])) &&
+        find(hiddenOptions.begin(), hiddenOptions.end(), toupper(input[0])) == hiddenOptions.end()) {
+        finalAnswer = toupper(input[0]);
+    } else {
+        cout << "Invalid answer. Marked as wrong.\n";
+        finalAnswer = 'X';
     }
 
     player->lastAnswer = finalAnswer;
@@ -134,6 +177,8 @@ void evaluateAnswers(const vector<Player*>& players, const Question& q) {
             if (player->lastAnswer == q.correct) {
                 player->score += 10;
                 cout << "Correct! +10 points.\n";
+            } else if (player->lastAnswer == 'X') {
+                cout << "No valid answer. 0 points.\n";
             } else {
                 cout << "Wrong. No points.\n";
             }
@@ -161,12 +206,10 @@ int main() {
     vector<Player*> activePlayers;
     mutex activeMutex;
 
-    // Step 1: Login Phase — Collect users
     cout << "Waiting for players to login...\n";
     vector<thread> threads;
-    vector<bool> joined(maxPlayers, false);
 
-    latch latch(maxPlayers);
+    std::latch latch(maxPlayers);
 
     for (int i = 0; i < maxPlayers; ++i) {
         players[i].id = i + 1;
@@ -197,7 +240,7 @@ int main() {
         });
     }
 
-    latch.wait();  // Wait until all players responded
+    latch.wait();
     for (auto& t : threads) t.join();
 
     if (activePlayers.empty()) {
@@ -207,9 +250,8 @@ int main() {
 
     cout << "\nGame Starting with " << activePlayers.size() << " players...\n";
 
-    barrier roundBarrier((int)activePlayers.size());
+    std::barrier roundBarrier((int)activePlayers.size());
 
-    // Step 2: Quiz Rounds
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         const Question& q = questions[round];
         cout << "\nRound " << (round + 1) << ": " << q.text << "\n";
@@ -220,7 +262,7 @@ int main() {
         for (Player* player : activePlayers) {
             roundThreads.emplace_back([&, player]() {
                 answerQuestion(player, q);
-                roundBarrier.arrive_and_wait();  // Wait for all to answer
+                roundBarrier.arrive_and_wait();
             });
         }
 
