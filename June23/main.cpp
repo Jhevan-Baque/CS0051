@@ -9,7 +9,7 @@
 #include <future>
 #include <latch>
 #include <barrier>
-#include <condition_variable>
+#include <atomic>
 #include <chrono>
 
 using namespace std;
@@ -96,74 +96,61 @@ void useAskAudience(const Question& q, Player& player) {
         cout << "  " << opt << ": " << votes << "%\n";
 }
 
-bool timedInput(Player* player, const Question& q, string& userInput, vector<char>& hiddenOptions) {
-    mutex mtx;
-    condition_variable cv;
-    bool answered = false;
-    int timeLimit = 10;
-
+bool answerTimedInput(Player* player, const Question& q, string& input, vector<char>& hiddenOptions) {
+    atomic<bool> timeout(false);
     thread timerThread([&]() {
-        unique_lock lock(mtx);
-        if (!cv.wait_for(lock, chrono::seconds(timeLimit), [&] { return answered; })) {
-            cout << "\n[" << player->name << "] Time's up!\n";
-            userInput = "TIMEOUT";
-        }
+        this_thread::sleep_for(chrono::seconds(10));
+        timeout = true;
     });
 
-    while (!answered) {
+    while (true) {
         {
             scoped_lock input_lock(input_mutex);
-            cout << "[" << player->name << "] Choose A/B/C/D or lifeline (5050 / call / ask): ";
-            getline(cin, userInput);
-            transform(userInput.begin(), userInput.end(), userInput.begin(), ::tolower);
+            cout << "[" << player->name << "] You have 10 seconds to answer.\n";
+            cout << "[" << player->name << "] Enter A/B/C/D or lifeline (5050 / call / ask): ";
+            getline(cin, input);
         }
 
-        if (userInput == "5050" || userInput == "call" || userInput == "ask") {
-            timeLimit += 5;
-            cout << "[Time Extended by 5s for lifeline. New total: " << timeLimit << "s]\n";
+        transform(input.begin(), input.end(), input.begin(), ::tolower);
 
-            if (userInput == "5050") {
-                use5050(q, *player, hiddenOptions);
-                showOptions(q.options, hiddenOptions);
-            } else if (userInput == "call") {
-                useCallFriend(q, *player);
-            } else if (userInput == "ask") {
-                useAskAudience(q, *player);
-            }
+        if (timeout) break;
 
-            continue;
+        if (input == "5050") {
+            use5050(q, *player, hiddenOptions);
+            showOptions(q.options, hiddenOptions);
+        } else if (input == "call") {
+            useCallFriend(q, *player);
+        } else if (input == "ask") {
+            useAskAudience(q, *player);
+        } else if (input.size() == 1 && q.options.count(toupper(input[0])) &&
+                   find(hiddenOptions.begin(), hiddenOptions.end(), toupper(input[0])) == hiddenOptions.end()) {
+            timerThread.join();
+            if (timeout) return false;
+            return true;
         } else {
-            {
-                lock_guard lock(mtx);
-                answered = true;
-            }
-            cv.notify_one();
-            break;
+            cout << "Invalid input.\n";
         }
+
+        if (timeout) break;
     }
 
     timerThread.join();
-    return userInput != "TIMEOUT";
+    return false;
 }
 
 void answerQuestion(Player* player, const Question& q) {
     char finalAnswer = ' ';
     vector<char> hiddenOptions;
-
     string input;
-    if (!timedInput(player, q, input, hiddenOptions)) {
-        player->lastAnswer = 'X';  // timeout
+
+    bool onTime = answerTimedInput(player, q, input, hiddenOptions);
+
+    if (!onTime) {
+        player->lastAnswer = 'X'; // Timeout or invalid
         return;
     }
 
-    if (input.size() == 1 && q.options.count(toupper(input[0])) &&
-        find(hiddenOptions.begin(), hiddenOptions.end(), toupper(input[0])) == hiddenOptions.end()) {
-        finalAnswer = toupper(input[0]);
-    } else {
-        cout << "Invalid answer. Marked as wrong.\n";
-        finalAnswer = 'X';
-    }
-
+    finalAnswer = toupper(input[0]);
     player->lastAnswer = finalAnswer;
 }
 
